@@ -1,0 +1,749 @@
+// ESP32 Poker Game - Player 1 (First Player)
+// MAC Address of player 1: 5c:01:3b:74:55:1c
+// Player 2 MAC: 5C:01:3B:74:3F:1C
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ====== CHIP VALUES AND BLINDS ======
+const float CHIP_VALUE_1 = 0.10;  // $0.10
+const float CHIP_VALUE_2 = 0.20;  // $0.20
+const float CHIP_VALUE_3 = 0.50;  // $0.50
+const float CHIP_VALUE_4 = 1.00;  // $1.00
+const float CHIP_VALUE_5 = 2.00;  // $2.00
+
+const float SMALL_BLIND = 0.50;   // Small blind amount
+const float BIG_BLIND = 1.00;     // Big blind amount
+
+// ====== DISPLAY CONFIGURATION ======
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define DISPLAY_SDA   8  // New SDA pin assignment
+#define DISPLAY_SCL   9  // New SCL pin assignment
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ====== PIN DEFINITIONS ======
+// Chip value buttons
+const int CHIP_BTN_1 = 11;  // $0.10
+const int CHIP_BTN_2 = 12;  // $0.20
+const int CHIP_BTN_3 = 13;  // $0.50
+const int CHIP_BTN_4 = 14;  // $1.00
+const int CHIP_BTN_5 = 15;  // $2.00
+
+// Action buttons
+const int CALL_BTN   = 16;  // Call bet
+const int RAISE_BTN  = 17;  // Confirm raise
+const int WON_BTN    = 18;  // Won hand
+const int CHECK_BTN  = 19;  // Check/Pass turn
+const int FOLD_BTN   = 20;  // Fold hand
+
+// Display and indicators
+const int TURN_INDICATOR = 10; // LED shows turn (keeping the same pin)
+
+// ====== BUTTON STATES ======
+bool lastChipBtn1State = LOW;
+bool lastChipBtn2State = LOW;
+bool lastChipBtn3State = LOW;
+bool lastChipBtn4State = LOW;
+bool lastChipBtn5State = LOW;
+bool lastCheckBtnState = LOW;
+bool lastCallBtnState = LOW;
+bool lastRaiseBtnState = LOW;
+bool lastFoldBtnState = LOW;
+bool lastWonBtnState = LOW;
+
+// ====== GAME DATA STRUCTURE ======
+struct GameData {
+  float pot;             // Current pot amount
+  float bet_amount;      // Amount bet by sender
+  bool is_fold;          // True if player folded
+  bool is_won;           // True if player won hand
+  bool hand_complete;    // True if hand is complete (for new hand setup)
+  bool new_hand;         // Signal for new hand initialization
+  bool reset_bets;       // Signal to reset bets
+  int hand_number;       // Tracks the number of hands played
+  bool high_priority;    // Flag for high priority messages (needs immediate handling)
+  bool game_started;     // Flag for game start
+  float buy_in_amount;   // Buy-in amount for both players
+};
+
+// ====== GAME VARIABLES ======
+// Other board's MAC address (Player 2)
+uint8_t otherBoard[] = {0x5C, 0x01, 0x3B, 0x74, 0x3F, 0x1C};
+
+// Game start flags
+bool game_started = false;
+bool selecting_buy_in = false;
+
+// Turn management
+bool myTurn = true;              // Player 1 starts first
+bool hand_complete = false;      // Flag for hand completion
+int hand_number = 1;             // Start with hand 1
+
+// Blind positions
+bool is_small_blind = true;      // Player 1 starts as SB when true
+bool is_big_blind = false;       // Player 1 is BB when true
+
+// Game state
+float balance = 100.00;          // Player's chip balance
+float pot = 0.00;                // Current pot amount
+float current_bet = 0.00;        // Current betting amount this turn
+float opponent_bet = 0.00;       // Opponent's bet amount
+float my_total_bet = 0.00;       // Total amount I've bet this hand
+
+// Game flags
+bool called = false;
+bool folded = false;
+bool won_hand = false;
+
+// Hand complete timer
+unsigned long handCompleteTime = 0;
+const unsigned long HAND_COMPLETE_DISPLAY_TIME = 2000; // 2 seconds
+
+// Message delivery tracking
+unsigned long lastMsgSentTime = 0;
+bool waitingForAck = false;
+const unsigned long MSG_TIMEOUT = 500; // 500 ms timeout for message acknowledgment
+
+// ====== FUNCTION DECLARATIONS ======
+void setupDisplay();
+void setupWiFi();
+void updateDisplay();
+void handleChipButtons();
+void handleActionButtons();
+void processCheckAction();
+void processCallAction();
+void processRaiseAction();
+void processFoldAction();
+void processWonHandAction();
+void endTurn(bool is_fold, bool is_won);
+void startNewHand();
+void sendGameData(float bet, bool is_fold, bool is_won, bool hand_complete, bool new_hand = false, bool reset_bets = false, bool high_priority = false);
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *data, int len);
+void updateTurnAndBlinds();
+
+// ====== DISPLAY FUNCTIONS ======
+void setupDisplay() {
+  // Initialize I2C with custom pins
+  Wire.begin(DISPLAY_SDA, DISPLAY_SCL);
+  
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true);
+  }
+  updateDisplay();
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Check if game has started
+  if (!game_started) {
+    if (!selecting_buy_in) {
+      // Initial game start screen
+      display.setCursor(10, 20);
+      display.print("Are you ready?");
+      display.setCursor(10, 35);
+      display.print("Press any chip btn to start");
+    } else {
+      // Buy-in selection screen
+      display.setCursor(10, 5);
+      display.print("Select buy-in amount:");
+      
+      display.setCursor(10, 20);
+      display.print("1 - $10.00");
+      
+      display.setCursor(10, 30);
+      display.print("2 - $20.00");
+      
+      display.setCursor(10, 40);
+      display.print("3 - $50.00");
+      
+      display.setCursor(10, 50);
+      display.print("4 - $100.00");
+    }
+    
+    // LED indicator off until game starts
+    digitalWrite(TURN_INDICATOR, LOW);
+    
+    display.display();
+    return;  // Exit early, don't show the rest
+  }
+  
+  // Display balance and blind position (SB or BB)
+  display.setCursor(0, 0);
+  display.print("Bal: $");
+  display.print(balance, 2);
+  
+  // Show blind position in top right corner
+  display.setCursor(100, 0);
+  if (is_small_blind) {
+    display.print("(SB)");
+  } else if (is_big_blind) {
+    display.print("(BB)");
+  }
+  
+  display.setCursor(0, 10);
+  display.print("Pot: $");
+  display.print(pot, 2);
+  
+  display.setCursor(0, 20);
+  display.print("My Bet: $");
+  display.print(my_total_bet, 2);
+  
+  // Display status based on game state
+  display.setCursor(0, 30);
+  if (hand_complete) {
+    display.print("Hand complete");
+    // Also show who starts next
+    display.setCursor(0, 40);
+    if ((hand_number + 1) % 2 == 1) {
+      display.print("P1 starts next");
+    } else {
+      display.print("P2 starts next");
+    }
+  } else if (folded) {
+    display.print("You folded");
+  } else if (won_hand) {
+    display.print("You won!");
+  } else if (!myTurn) {
+    display.print("Waiting for opponent...");
+  } else if (opponent_bet > my_total_bet) {
+    float to_call = opponent_bet - my_total_bet;
+    display.print("To Call: $");
+    display.print(to_call, 2);
+    
+    // Show current raise if any
+    if (current_bet > 0) {
+      display.setCursor(0, 40);
+      display.print("Raising: $");
+      display.print(current_bet, 2);
+    }
+  } else if (myTurn) {
+    display.print("Your turn");
+    
+    // Show current raise if any
+    if (current_bet > 0) {
+      display.setCursor(0, 40);
+      display.print("Betting: $");
+      display.print(current_bet, 2);
+    }
+  }
+  
+  // Display hand number in bottom right
+  display.setCursor(110, 56);
+  display.print(hand_number);
+  
+  // LED indicator for turn
+  if (hand_complete) {
+    // Blink LED when hand is complete
+    digitalWrite(TURN_INDICATOR, (millis() / 500) % 2);
+  } else {
+    digitalWrite(TURN_INDICATOR, myTurn ? HIGH : LOW);
+  }
+  
+  display.display();
+}
+
+// ====== WIFI SETUP ======
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  
+  if (esp_now_init() != ESP_OK) {
+    while (true);
+  }
+  
+  // Register peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, otherBoard, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    while (true);
+  }
+  
+  // Register callback function
+  esp_now_register_recv_cb(onDataReceived);
+}
+
+// ====== ACTION FUNCTIONS ======
+void processCheckAction() {
+  if (!myTurn) return;
+  
+  endTurn(false, false);
+}
+
+void processCallAction() {
+  if (!myTurn) return;
+  
+  // Only meaningful if opponent has bet more
+  if (opponent_bet > my_total_bet) {
+    float call_amount = opponent_bet - my_total_bet;
+    
+    // Update balance and total bet
+    balance -= call_amount;
+    my_total_bet = opponent_bet;
+    called = true;
+    
+    // Update pot immediately when calling
+    pot += call_amount;
+    
+    endTurn(false, false);
+  }
+}
+
+void processRaiseAction() {
+  if (!myTurn || current_bet <= 0) return;
+  
+  float total_new_bet = my_total_bet + current_bet;
+  
+  // Make sure we're at least matching opponent's bet
+  if (total_new_bet < opponent_bet) {
+    return;
+  }
+  
+  // Update my total bet for this hand
+  my_total_bet = total_new_bet;
+  
+  endTurn(false, false);
+}
+
+void processFoldAction() {
+  if (!myTurn) return;
+  
+  folded = true;
+  
+  // When folding, opponent gets the pot
+  endTurn(true, false);
+}
+
+void processWonHandAction() {
+  if (!myTurn) return;
+  
+  won_hand = true;
+  
+  // Add pot to balance
+  balance += pot;
+  
+  endTurn(false, true);
+}
+
+// ====== BUTTON HANDLING ======
+void handleChipButtons() {
+  // Check for game start first
+  if (!game_started) {
+    // Read current button states
+    bool currentChipBtn1State = digitalRead(CHIP_BTN_1);
+    bool currentChipBtn2State = digitalRead(CHIP_BTN_2);
+    bool currentChipBtn3State = digitalRead(CHIP_BTN_3);
+    bool currentChipBtn4State = digitalRead(CHIP_BTN_4);
+    bool currentChipBtn5State = digitalRead(CHIP_BTN_5);
+    
+    if (!selecting_buy_in) {
+      // Initial game start - check if any chip button was pressed
+      if ((currentChipBtn1State && !lastChipBtn1State) ||
+          (currentChipBtn2State && !lastChipBtn2State) ||
+          (currentChipBtn3State && !lastChipBtn3State) ||
+          (currentChipBtn4State && !lastChipBtn4State) ||
+          (currentChipBtn5State && !lastChipBtn5State)) {
+        
+        // Move to buy-in selection
+        selecting_buy_in = true;
+        
+        // Update display with buy-in options
+        updateDisplay();
+        
+        // Update button states
+        lastChipBtn1State = currentChipBtn1State;
+        lastChipBtn2State = currentChipBtn2State;
+        lastChipBtn3State = currentChipBtn3State;
+        lastChipBtn4State = currentChipBtn4State;
+        lastChipBtn5State = currentChipBtn5State;
+        
+        return;
+      }
+    } else {
+      // Buy-in selection mode
+      float selected_buy_in = 0.00;
+      
+      // Check which buy-in was selected (using buttons 1-4)
+      if (currentChipBtn1State && !lastChipBtn1State) {
+        selected_buy_in = 10.00;  // $10
+      } else if (currentChipBtn2State && !lastChipBtn2State) {
+        selected_buy_in = 20.00;  // $20
+      } else if (currentChipBtn3State && !lastChipBtn3State) {
+        selected_buy_in = 50.00;  // $50
+      } else if (currentChipBtn4State && !lastChipBtn4State) {
+        selected_buy_in = 100.00; // $100
+      }
+      
+      // If a buy-in was selected
+      if (selected_buy_in > 0) {
+        // Set balance for both players
+        balance = selected_buy_in;
+        
+        // Start the game
+        game_started = true;
+        
+        // Send a game start signal to Player 2 with buy-in amount
+        GameData gameData;
+        gameData.pot = 0.00;
+        gameData.bet_amount = 0.00;
+        gameData.is_fold = false;
+        gameData.is_won = false;
+        gameData.hand_complete = false;
+        gameData.new_hand = true;
+        gameData.reset_bets = true;
+        gameData.hand_number = hand_number;
+        gameData.high_priority = true;
+        gameData.game_started = true;
+        gameData.buy_in_amount = selected_buy_in;
+        
+        esp_now_send(otherBoard, (uint8_t *)&gameData, sizeof(gameData));
+        
+        // Update display with game information
+        updateDisplay();
+      }
+    }
+    
+    // Update button states
+    lastChipBtn1State = currentChipBtn1State;
+    lastChipBtn2State = currentChipBtn2State;
+    lastChipBtn3State = currentChipBtn3State;
+    lastChipBtn4State = currentChipBtn4State;
+    lastChipBtn5State = currentChipBtn5State;
+    
+    return;  // Exit early if game hasn't started
+  }
+  
+  if (!myTurn || hand_complete) return;
+  
+  // Read current button states
+  bool currentChipBtn1State = digitalRead(CHIP_BTN_1);
+  bool currentChipBtn2State = digitalRead(CHIP_BTN_2);
+  bool currentChipBtn3State = digitalRead(CHIP_BTN_3);
+  bool currentChipBtn4State = digitalRead(CHIP_BTN_4);
+  bool currentChipBtn5State = digitalRead(CHIP_BTN_5);
+  
+  // Check for button press events
+  if (currentChipBtn1State && !lastChipBtn1State) {
+    current_bet += CHIP_VALUE_1;
+    balance -= CHIP_VALUE_1;
+  }
+  
+  if (currentChipBtn2State && !lastChipBtn2State) {
+    current_bet += CHIP_VALUE_2;
+    balance -= CHIP_VALUE_2;
+  }
+  
+  if (currentChipBtn3State && !lastChipBtn3State) {
+    current_bet += CHIP_VALUE_3;
+    balance -= CHIP_VALUE_3;
+  }
+  
+  if (currentChipBtn4State && !lastChipBtn4State) {
+    current_bet += CHIP_VALUE_4;
+    balance -= CHIP_VALUE_4;
+  }
+  
+  if (currentChipBtn5State && !lastChipBtn5State) {
+    current_bet += CHIP_VALUE_5;
+    balance -= CHIP_VALUE_5;
+  }
+  
+  // Update button states
+  lastChipBtn1State = currentChipBtn1State;
+  lastChipBtn2State = currentChipBtn2State;
+  lastChipBtn3State = currentChipBtn3State;
+  lastChipBtn4State = currentChipBtn4State;
+  lastChipBtn5State = currentChipBtn5State;
+}
+
+void handleActionButtons() {
+  if (!game_started || !myTurn || hand_complete) return;
+  
+  // Read button states
+  bool currentCheckBtnState = digitalRead(CHECK_BTN);
+  bool currentCallBtnState = digitalRead(CALL_BTN);
+  bool currentRaiseBtnState = digitalRead(RAISE_BTN);
+  bool currentFoldBtnState = digitalRead(FOLD_BTN);
+  bool currentWonBtnState = digitalRead(WON_BTN);
+  
+  // Check for button press events
+  if (currentCheckBtnState && !lastCheckBtnState) {
+    processCheckAction();
+  }
+  
+  if (currentCallBtnState && !lastCallBtnState) {
+    processCallAction();
+  }
+  
+  if (currentRaiseBtnState && !lastRaiseBtnState) {
+    processRaiseAction();
+  }
+  
+  if (currentFoldBtnState && !lastFoldBtnState) {
+    processFoldAction();
+  }
+  
+  if (currentWonBtnState && !lastWonBtnState) {
+    processWonHandAction();
+  }
+  
+  // Update button states
+  lastCheckBtnState = currentCheckBtnState;
+  lastCallBtnState = currentCallBtnState;
+  lastRaiseBtnState = currentRaiseBtnState;
+  lastFoldBtnState = currentFoldBtnState;
+  lastWonBtnState = currentWonBtnState;
+}
+
+// ====== GAME FLOW FUNCTIONS ======
+void updateTurnAndBlinds() {
+  // For Player 1
+  // SB on odd hands, BB on even hands
+  is_small_blind = (hand_number % 2 == 1);
+  is_big_blind = !is_small_blind;
+  
+  // Player 1 is first to act if they're SB
+  myTurn = is_small_blind;
+}
+
+void endTurn(bool is_fold, bool is_won) {
+  // Check for hand completion
+  bool complete_hand = is_fold || is_won;
+  
+  // Update pot (only if not folding or winning and raising)
+  // Call has already updated the pot in processCallAction
+  if (!complete_hand && !called && current_bet > 0) {
+    pot += current_bet;
+  }
+  
+  // For hand completion (fold or won), we want to signal a bet reset
+  bool reset_bets_signal = complete_hand;
+  
+  // If hand is complete, set up for next hand
+  if (complete_hand) {
+    hand_complete = true;
+    handCompleteTime = millis(); // Start hand complete timer
+    
+    // Reset my bet immediately
+    my_total_bet = 0.00;
+    
+    // Increment hand number on hand completion
+    hand_number++;
+    
+    // Send with high priority flag to ensure quick delivery
+    sendGameData(my_total_bet, is_fold, is_won, complete_hand, false, reset_bets_signal, true);
+    
+    // Update turn and blinds based on new hand number
+    updateTurnAndBlinds();
+  } else {
+    // Regular turn, no need for high priority
+    sendGameData(my_total_bet, is_fold, is_won, complete_hand, false, reset_bets_signal, false);
+    
+    // Update turn state
+    myTurn = false;
+  }
+  
+  // Reset current bet for next turn
+  current_bet = 0.00;
+  called = false;
+  
+  updateDisplay();
+}
+
+void startNewHand() {
+  // Reset game state for new hand
+  pot = 0.00;
+  my_total_bet = 0.00;  // Reset my bet for new hand
+  opponent_bet = 0.00;
+  current_bet = 0.00;
+  
+  // Reset flags
+  called = false;
+  folded = false;
+  won_hand = false;
+  hand_complete = false;
+  
+  // Update turn and blinds based on current hand number
+  updateTurnAndBlinds();
+  
+  // Send a new hand signal to ensure synchronization with high priority
+  sendGameData(0.00, false, false, false, true, true, true);
+  
+  // Update display
+  updateDisplay();
+}
+
+// ====== COMMUNICATION FUNCTIONS ======
+void sendGameData(float bet, bool is_fold, bool is_won, bool hand_complete, bool new_hand, bool reset_bets, bool high_priority) {
+  GameData gameData;
+  gameData.pot = pot;
+  gameData.bet_amount = bet;
+  gameData.is_fold = is_fold;
+  gameData.is_won = is_won;
+  gameData.hand_complete = hand_complete;
+  gameData.new_hand = new_hand;
+  gameData.reset_bets = reset_bets;
+  gameData.hand_number = hand_number;  // Include hand number in sent data
+  gameData.high_priority = high_priority;
+  gameData.game_started = game_started;  // Add game started flag
+  
+  // Send the data
+  esp_now_send(otherBoard, (uint8_t *)&gameData, sizeof(gameData));
+  
+  // If it's a high priority message, set up for potential retransmission
+  if (high_priority) {
+    waitingForAck = true;
+    lastMsgSentTime = millis();
+  }
+}
+
+void onDataReceived(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len == sizeof(GameData)) {
+    GameData receivedData;
+    memcpy(&receivedData, data, sizeof(GameData));
+    
+    // Update hand number from received data
+    hand_number = receivedData.hand_number;
+    
+    // Check if this is a new hand signal
+    if (receivedData.new_hand) {
+      // Reset game state for new hand
+      pot = receivedData.pot;
+      opponent_bet = receivedData.bet_amount;
+      
+      // Reset flags
+      called = false;
+      folded = false;
+      won_hand = false;
+      hand_complete = false;
+      
+      // Reset bets when new hand starts
+      my_total_bet = 0.00;
+      
+      // Update turn and blinds based on received hand number
+      updateTurnAndBlinds();
+      
+      updateDisplay();
+      return;
+    }
+    
+    // Check for explicit reset bets signal
+    if (receivedData.reset_bets) {
+      my_total_bet = 0.00;
+    }
+    
+    // Update game state
+    pot = receivedData.pot;
+    opponent_bet = receivedData.bet_amount;
+    
+    // Check for hand completion
+    if (receivedData.is_fold) {
+      // If opponent folded, we get the pot
+      balance += pot;
+      hand_complete = true;
+      handCompleteTime = millis(); // Start hand complete timer
+      
+      // Reset my bet when hand completes
+      my_total_bet = 0.00;
+      
+      // Update turn and blinds based on received hand number
+      updateTurnAndBlinds();
+    } 
+    else if (receivedData.is_won) {
+      hand_complete = true;
+      handCompleteTime = millis(); // Start hand complete timer
+      
+      // Reset my bet when hand completes
+      my_total_bet = 0.00;
+      
+      // Update turn and blinds based on received hand number
+      updateTurnAndBlinds();
+    }
+    else if (receivedData.hand_complete) {
+      hand_complete = true;
+      handCompleteTime = millis(); // Start hand complete timer
+      
+      // Reset my bet when hand completes
+      my_total_bet = 0.00;
+      
+      // Update turn and blinds based on received hand number
+      updateTurnAndBlinds();
+    }
+    else {
+      // Regular turn
+      hand_complete = false;
+      myTurn = true;
+    }
+    
+    updateDisplay();
+  }
+}
+
+// ====== SETUP ======
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(CHIP_BTN_1, INPUT);
+  pinMode(CHIP_BTN_2, INPUT);
+  pinMode(CHIP_BTN_3, INPUT);
+  pinMode(CHIP_BTN_4, INPUT);
+  pinMode(CHIP_BTN_5, INPUT);
+  pinMode(CHECK_BTN, INPUT);
+  pinMode(CALL_BTN, INPUT);
+  pinMode(RAISE_BTN, INPUT);
+  pinMode(FOLD_BTN, INPUT);
+  pinMode(WON_BTN, INPUT);
+  pinMode(TURN_INDICATOR, OUTPUT);
+  
+  // Set initial LED state
+  digitalWrite(TURN_INDICATOR, LOW);  // Off until game starts
+  
+  // Initialize hand number and blind positions - Player 1 starts as SB on hand 1
+  hand_number = 1;
+  updateTurnAndBlinds(); // Set up initial blinds and turns
+  
+  // Initialize display
+  setupDisplay();
+  
+  // Initialize WiFi and ESP-NOW
+  setupWiFi();
+}
+
+// ====== MAIN LOOP ======
+void loop() {
+  // Check if hand_complete state should timeout
+  if (game_started && hand_complete && (millis() - handCompleteTime > HAND_COMPLETE_DISPLAY_TIME)) {
+    startNewHand();
+  }
+  
+  // Check if we need to retransmit a high priority message
+  if (waitingForAck && (millis() - lastMsgSentTime > MSG_TIMEOUT)) {
+    // Resend the last game state (future enhancement)
+    // For now, just timeout the waiting state
+    waitingForAck = false;
+  }
+  
+  // Handle inputs
+  handleChipButtons();
+  handleActionButtons();
+  
+  // Update display periodically
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 200) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  // Small delay to debounce buttons
+  delay(50);
+}
